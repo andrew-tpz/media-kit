@@ -47,6 +47,8 @@ class NativeVideoController extends PlatformVideoController {
   /// Height of the video (from [VideoParams]).
   int? videoParamsHeight;
 
+  String? _lastDiagnosticsLog;
+
   /// [Lock] used to synchronize [onLoadHooks], [onUnloadHooks] & [subscription].
   final lock = Lock();
 
@@ -63,6 +65,51 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  Future<void> _logLinuxDiagnostics(VideoParams event) async {
+    if (!Platform.isLinux) {
+      return;
+    }
+    if (event.pixelformat == null && event.hwPixelformat == null) {
+      return;
+    }
+    try {
+      final hwdecCurrent = await platform.getProperty(
+        'hwdec-current',
+        waitForInitialization: false,
+      );
+      final hwdecInterop = await platform.getProperty(
+        'hwdec-interop',
+        waitForInitialization: false,
+      );
+      final currentVo = await platform.getProperty(
+        'current-vo',
+        waitForInitialization: false,
+      );
+
+      final hwdec = hwdecCurrent.isEmpty || hwdecCurrent == 'no'
+          ? 'none'
+          : hwdecCurrent;
+      final decoder = hwdec == 'none' ? 'SW' : 'HW';
+      final cpuCopy = hwdec.endsWith('-copy') ? 'yes' : 'no';
+      final message = [
+        '$decoder decode=$hwdec',
+        'interop=${hwdecInterop.isEmpty ? 'none' : hwdecInterop}',
+        'pix=${event.pixelformat ?? 'unknown'}',
+        'hw-pix=${event.hwPixelformat ?? 'none'}',
+        'copy-back=$cpuCopy',
+        'vo=${currentVo.isEmpty ? 'unavailable' : currentVo}',
+      ].join(' ');
+      if (_lastDiagnosticsLog != message) {
+        _lastDiagnosticsLog = message;
+        debugPrint('media_kit: NativeVideoController: $message');
+      }
+    } catch (exception) {
+      debugPrint(
+        'media_kit: NativeVideoController: diagnostics unavailable: $exception',
+      );
+    }
+  }
+
   /// [StreamSubscription] for listening to video [Rect].
   StreamSubscription<VideoParams>? videoParamsSubscription;
 
@@ -74,6 +121,8 @@ class NativeVideoController extends PlatformVideoController {
         height = configuration.height {
     videoParamsSubscription = player.stream.videoParams.listen(
       (event) => lock.synchronized(() async {
+        await _logLinuxDiagnostics(event);
+
         if ([0, null].contains(event.dw) || [0, null].contains(event.dh)) {
           return;
         }
@@ -157,6 +206,10 @@ class NativeVideoController extends PlatformVideoController {
       {
         'vo': configuration.vo!,
         'hwdec': configuration.hwdec!,
+        if (Platform.isLinux) ...{
+          'gpu-hwdec-interop': 'auto',
+          'hwdec-codecs': 'h264,hevc,mpeg4,mpeg2video,vp8,vp9,av1',
+        },
         'vid': 'auto',
       },
     );
@@ -167,7 +220,6 @@ class NativeVideoController extends PlatformVideoController {
     void listener() {
       final value = controller.id.value;
       if (value != null) {
-        debugPrint('NativeVideoController: Texture ID: $value');
         completer.complete();
       }
     }
@@ -259,8 +311,6 @@ class NativeVideoController extends PlatformVideoController {
         ..setMethodCallHandler(
           (MethodCall call) async {
             try {
-              debugPrint(call.method.toString());
-              debugPrint(call.arguments.toString());
               switch (call.method) {
                 case 'VideoOutput.Resize':
                   {

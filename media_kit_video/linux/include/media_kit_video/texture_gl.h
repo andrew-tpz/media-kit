@@ -22,6 +22,8 @@ G_DECLARE_FINAL_TYPE(TextureGL, texture_gl, TEXTURE_GL, TEXTURE_GL, FlTextureGL)
 
 TextureGL* texture_gl_new(VideoOutput* video_output);
 
+gboolean texture_gl_is_supported();
+
 /**
  * @brief Populates texture with video frame.
  */

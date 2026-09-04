@@ -98,6 +98,10 @@ EGLContext video_output_get_egl_context(VideoOutput* self);
 
 EGLSurface video_output_get_egl_surface(VideoOutput* self);
 
+void video_output_lock_egl();
+
+void video_output_unlock_egl();
+
 guint8* video_output_get_pixel_buffer(VideoOutput* self);
 
 gint64 video_output_get_width(VideoOutput* self);
