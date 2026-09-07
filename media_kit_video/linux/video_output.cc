@@ -7,6 +7,7 @@
 // LICENSE file.
 
 #include "include/media_kit_video/video_output.h"
+#include "include/media_kit_video/scoped_egl_context.h"
 #include "include/media_kit_video/texture_gl.h"
 #include "include/media_kit_video/texture_sw.h"
 
@@ -76,20 +77,16 @@ static void video_output_dispose(GObject* object) {
       self->texture_gl_registered = FALSE;
     }
 
-    video_output_lock_egl();
-
-    EGLDisplay previous_display = eglGetCurrentDisplay();
-    EGLContext previous_context = eglGetCurrentContext();
-    EGLSurface previous_draw_surface = eglGetCurrentSurface(EGL_DRAW);
-    EGLSurface previous_read_surface = eglGetCurrentSurface(EGL_READ);
+    ScopedEglContext egl_scope(
+        GDK_IS_X11_DISPLAY(gdk_display_get_default()));
 
     gboolean egl_context_current = FALSE;
     if (self->egl_display != EGL_NO_DISPLAY &&
         self->egl_context != EGL_NO_CONTEXT &&
         self->egl_surface != EGL_NO_SURFACE) {
       egl_context_current =
-          eglMakeCurrent(self->egl_display, self->egl_surface,
-                         self->egl_surface, self->egl_context);
+          egl_scope.MakeCurrent(self->egl_display, self->egl_surface,
+                                self->egl_context);
       if (!egl_context_current) {
         g_printerr(
             "media_kit: VideoOutput: failed to make EGL context current "
@@ -98,28 +95,15 @@ static void video_output_dispose(GObject* object) {
       }
     }
 
-    if (self->render_context != NULL) {
+    if (egl_context_current && self->render_context != NULL) {
       mpv_render_context_free(self->render_context);
       self->render_context = NULL;
     }
 
-    if (egl_context_current) {
-      eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                     EGL_NO_CONTEXT);
-    }
-
-    if (previous_display != EGL_NO_DISPLAY &&
-        previous_context != EGL_NO_CONTEXT) {
-      eglMakeCurrent(previous_display, previous_draw_surface,
-                     previous_read_surface, previous_context);
-    }
-
-    video_output_unlock_egl();
-
     g_object_unref(self->texture_gl);
     self->texture_gl = NULL;
 
-    video_output_lock_egl();
+    egl_scope.Restore();
 
     if (self->egl_surface != EGL_NO_SURFACE) {
       eglDestroySurface(self->egl_display, self->egl_surface);
@@ -130,8 +114,6 @@ static void video_output_dispose(GObject* object) {
       eglDestroyContext(self->egl_display, self->egl_context);
       self->egl_context = EGL_NO_CONTEXT;
     }
-
-    video_output_unlock_egl();
   }
   // S/W
   if (self->texture_sw) {
@@ -211,12 +193,16 @@ static const gchar* egl_error_to_string(EGLint error) {
   }
 }
 
-static std::string egl_error_message(const gchar* action) {
-  const EGLint error = eglGetError();
+static std::string egl_error_message_from_code(const gchar* action,
+                                               EGLint error) {
   gchar error_hex[16];
   g_snprintf(error_hex, sizeof(error_hex), "0x%x", error);
   return std::string(action) + " failed: " + egl_error_to_string(error) +
          " (" + error_hex + ")";
+}
+
+static std::string egl_error_message(const gchar* action) {
+  return egl_error_message_from_code(action, eglGetError());
 }
 
 static const gchar* gdk_display_backend_name(GdkDisplay* display) {
@@ -375,6 +361,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   std::string fallback_reason;
   if (self->configuration.enable_hardware_acceleration) {
     GdkDisplay* display = gdk_display_get_default();
+    ScopedEglContext egl_scope(GDK_IS_X11_DISPLAY(display));
     const gchar* backend = gdk_display_backend_name(display);
     std::string egl_display_details;
     self->egl_display =
@@ -416,106 +403,106 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
             if (self->egl_surface == EGL_NO_SURFACE) {
               fallback_reason = egl_error_message("eglCreatePbufferSurface");
             } else {
-              video_output_lock_egl();
               const gboolean egl_context_current =
-                  eglMakeCurrent(self->egl_display, self->egl_surface,
-                                 self->egl_surface, self->egl_context);
+                  egl_scope.MakeCurrent(self->egl_display, self->egl_surface,
+                                        self->egl_context);
               if (!egl_context_current) {
-                fallback_reason = egl_error_message("eglMakeCurrent");
-              } else if (!texture_gl_is_supported()) {
-                fallback_reason =
-                    "required EGLImage/OpenGL ES interop extensions are "
-                    "missing";
-              } else {
-                const std::string gl_renderer = get_current_gl_renderer();
-                self->texture_gl = texture_gl_new(self);
-
-                if (fl_texture_registrar_register_texture(
-                        texture_registrar, FL_TEXTURE(self->texture_gl))) {
-                  self->texture_gl_registered = TRUE;
-
-                  mpv_opengl_init_params gl_init_params{
-                      [](auto, auto name) {
-                        return (void*)eglGetProcAddress(name);
-                      },
-                      NULL,
-                  };
-
-                  mpv_render_param params[4] = {
-                      {MPV_RENDER_PARAM_API_TYPE,
-                       (void*)MPV_RENDER_API_TYPE_OPENGL},
-                      {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
-                       (void*)&gl_init_params},
-                      {MPV_RENDER_PARAM_INVALID, (void*)0},
-                      {MPV_RENDER_PARAM_INVALID, (void*)0},
-                  };
-
-                  // VAAPI needs the same native display that backs the EGL context.
-                  const gchar* vaapi_display = "unavailable";
-                  if (GDK_IS_WAYLAND_DISPLAY(display)) {
-                    params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
-                    params[2].data =
-                        gdk_wayland_display_get_wl_display(display);
-                    vaapi_display = "wayland";
-                  } else if (GDK_IS_X11_DISPLAY(display)) {
-                    params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
-                    params[2].data = gdk_x11_display_get_xdisplay(display);
-                    vaapi_display = "x11";
-                  }
-
-                  const int result = mpv_render_context_create(
-                      &self->render_context, self->handle, params);
-                  if (result == 0) {
-                    mpv_render_context_set_update_callback(
-                        self->render_context,
-                        [](void* data) {
-                          VideoOutput* self = (VideoOutput*)data;
-                          if (self->destroyed) {
-                            return;
-                          }
-                          fl_texture_registrar_mark_texture_frame_available(
-                              self->texture_registrar,
-                              FL_TEXTURE(self->texture_gl));
-                        },
-                        self);
-                    hardware_acceleration_supported = TRUE;
-                    g_print(
-                        "media_kit: VideoOutput: HW render=gpu "
-                        "api=libmpv/opengl texture-interop=egl-image "
-                        "vaapi-display=%s backend=%s egl=%d.%d gl=\"%s\" "
-                        "cpu-copy=no\n",
-                        vaapi_display,
-                        backend,
-                        egl_major,
-                        egl_minor,
-                        gl_renderer.c_str());
-                  } else {
-                    fallback_reason =
-                        std::string("mpv_render_context_create failed: ") +
-                        mpv_error_string(result);
-                  }
-                } else {
-                  fallback_reason =
-                      "Flutter texture registrar rejected FlTextureGL";
-                }
+                fallback_reason = egl_error_message("bind mpv EGL context");
               }
               if (egl_context_current) {
-                eglMakeCurrent(self->egl_display, EGL_NO_SURFACE,
-                               EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                if (!texture_gl_is_supported()) {
+                  fallback_reason =
+                      "required EGLImage/OpenGL ES interop extensions are "
+                      "missing";
+                } else {
+                  const std::string gl_renderer = get_current_gl_renderer();
+                  self->texture_gl = texture_gl_new(self);
+
+                  if (fl_texture_registrar_register_texture(
+                          texture_registrar, FL_TEXTURE(self->texture_gl))) {
+                    self->texture_gl_registered = TRUE;
+
+                    mpv_opengl_init_params gl_init_params{
+                        [](auto, auto name) {
+                          return (void*)eglGetProcAddress(name);
+                        },
+                        NULL,
+                    };
+
+                    mpv_render_param params[4] = {
+                        {MPV_RENDER_PARAM_API_TYPE,
+                         (void*)MPV_RENDER_API_TYPE_OPENGL},
+                        {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                         (void*)&gl_init_params},
+                        {MPV_RENDER_PARAM_INVALID, (void*)0},
+                        {MPV_RENDER_PARAM_INVALID, (void*)0},
+                    };
+
+                    // VAAPI needs the same native display that backs the EGL context.
+                    const gchar* vaapi_display = "unavailable";
+                    if (GDK_IS_WAYLAND_DISPLAY(display)) {
+                      params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
+                      params[2].data =
+                          gdk_wayland_display_get_wl_display(display);
+                      vaapi_display = "wayland";
+                    } else if (GDK_IS_X11_DISPLAY(display)) {
+                      params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
+                      params[2].data = gdk_x11_display_get_xdisplay(display);
+                      vaapi_display = "x11";
+                    }
+
+                    const int result = mpv_render_context_create(
+                        &self->render_context, self->handle, params);
+                    if (result == 0) {
+                      mpv_render_context_set_update_callback(
+                          self->render_context,
+                          [](void* data) {
+                            VideoOutput* self = (VideoOutput*)data;
+                            if (self->destroyed) {
+                              return;
+                            }
+                            fl_texture_registrar_mark_texture_frame_available(
+                                self->texture_registrar,
+                                FL_TEXTURE(self->texture_gl));
+                          },
+                          self);
+                      hardware_acceleration_supported = TRUE;
+                      g_print(
+                          "media_kit: VideoOutput: HW render=gpu "
+                          "player=%p api=libmpv/opengl texture-interop=egl-image "
+                          "vaapi-display=%s backend=%s host-context=%s "
+                          "egl=%d.%d gl=\"%s\" "
+                          "cpu-copy=no\n",
+                          (void*)self->handle,
+                          vaapi_display,
+                          backend,
+                          egl_scope.HostContextType(),
+                          egl_major,
+                          egl_minor,
+                          gl_renderer.c_str());
+                    } else {
+                      fallback_reason =
+                          std::string("mpv_render_context_create failed: ") +
+                          mpv_error_string(result);
+                    }
+                  } else {
+                    fallback_reason =
+                        "Flutter texture registrar rejected FlTextureGL";
+                  }
+                }
               }
-              video_output_unlock_egl();
+              if (!egl_scope.Restore()) {
+                g_printerr(
+                    "media_kit: VideoOutput: failed to restore previous "
+                    "EGL context after GPU renderer init player=%p "
+                    "error=0x%x\n",
+                    (void*)self->handle,
+                    eglGetError());
+              }
             }
           }
         }
       }
-    }
-
-    if (self->egl_display != EGL_NO_DISPLAY &&
-        self->egl_context != EGL_NO_CONTEXT) {
-      video_output_lock_egl();
-      eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                     EGL_NO_CONTEXT);
-      video_output_unlock_egl();
     }
 
     if (!hardware_acceleration_supported) {
@@ -531,12 +518,6 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
       if (self->render_context != NULL) {
         mpv_render_context_free(self->render_context);
         self->render_context = NULL;
-      }
-      if (self->egl_display != EGL_NO_DISPLAY) {
-        video_output_lock_egl();
-        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                       EGL_NO_CONTEXT);
-        video_output_unlock_egl();
       }
       if (self->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(self->egl_display, self->egl_surface);
@@ -556,7 +537,8 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
     }
     g_printerr(
         "media_kit: VideoOutput: SW render=software api=libmpv/sw "
-        "cpu-copy=yes reason=\"%s\"\n",
+        "player=%p cpu-copy=yes reason=\"%s\"\n",
+        (void*)self->handle,
         fallback_reason.c_str());
     // H/W rendering failed. Fallback to S/W rendering.
     self->pixel_buffer = g_new0(guint8, SW_RENDERING_PIXEL_BUFFER_SIZE);
@@ -652,6 +634,10 @@ void video_output_set_size(VideoOutput* self, gint64 width, gint64 height) {
 
 mpv_render_context* video_output_get_render_context(VideoOutput* self) {
   return self->render_context;
+}
+
+mpv_handle* video_output_get_handle(VideoOutput* self) {
+  return self->handle;
 }
 
 EGLDisplay video_output_get_egl_display(VideoOutput* self) {

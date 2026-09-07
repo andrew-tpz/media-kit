@@ -90,6 +90,8 @@ void video_output_set_size(VideoOutput* self, gint64 width, gint64 height);
 
 mpv_render_context* video_output_get_render_context(VideoOutput* self);
 
+mpv_handle* video_output_get_handle(VideoOutput* self);
+
 GdkGLContext* video_output_get_gdk_gl_context(VideoOutput* self);
 
 EGLDisplay video_output_get_egl_display(VideoOutput* self);

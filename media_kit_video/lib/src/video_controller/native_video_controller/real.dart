@@ -85,6 +85,8 @@ class NativeVideoController extends PlatformVideoController {
         'current-vo',
         waitForInitialization: false,
       );
+      final handle = await player.handle;
+      final playerId = '0x${handle.toUnsigned(64).toRadixString(16)}';
 
       final hwdec = hwdecCurrent.isEmpty || hwdecCurrent == 'no'
           ? 'none'
@@ -93,6 +95,7 @@ class NativeVideoController extends PlatformVideoController {
       final cpuCopy = hwdec.endsWith('-copy') ? 'yes' : 'no';
       final message = [
         '$decoder decode=$hwdec',
+        'player=$playerId',
         'interop=${hwdecInterop.isEmpty ? 'none' : hwdecInterop}',
         'pix=${event.pixelformat ?? 'unknown'}',
         'hw-pix=${event.hwPixelformat ?? 'none'}',
